@@ -1,0 +1,6 @@
+scikit-learn>=1.4
+numpy>=1.26
+google-genai>=1.0
+flask>=3.0
+python-dotenv>=1.0
+gunicorn>=22.0
