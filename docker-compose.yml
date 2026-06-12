@@ -1,0 +1,13 @@
+services:
+  log-analyst:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - log-analyst-data:/data
+    restart: unless-stopped
+
+volumes:
+  log-analyst-data:
