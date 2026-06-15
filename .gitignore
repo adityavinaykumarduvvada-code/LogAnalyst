@@ -1,0 +1,9 @@
+secure_log/
+__pycache__/
+*.pyc
+.env
+index.pkl
+*.egg-info/
+data/uploaded_logs/
+frontend/node_modules/
+frontend/dist/
