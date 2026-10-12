@@ -37,7 +37,7 @@ def build_prompt(question: str, retrieved: List[Tuple[Chunk, float]]) -> str:
 
 
 class RAGEngine:
-    def __init__(self, store: VectorStore, model: str = "gemini-3.6-flash", top_k: int = 6):
+    def __init__(self, store: VectorStore, model: str = "gemini-3.7-flash", top_k: int = 6):
         self.store = store
         self.model = model
         self.top_k = top_k
