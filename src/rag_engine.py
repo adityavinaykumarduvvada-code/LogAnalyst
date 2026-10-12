@@ -38,7 +38,14 @@ DEFAULT_MODELS: List[str] = [
 # HTTP codes that mean "this model is busy/unavailable right now -> try the next one".
 #   429 = rate limited / quota exhausted, 500/502/503/504 = overloaded or server error,
 #   404 = model name not found (retired or not enabled for your key).
-FALLBACK_STATUS_CODES = {404, 429, 500, 502, 503, 504}
+FALLBACK_STATUS_CODES = {404, 408, 429, 500, 502, 503, 504}
+
+# Time limits. gunicorn kills a worker after 120s (see Procfile/Dockerfile), and the
+# host then returns an HTML 502 page instead of our JSON. So every Gemini call gets
+# its own timeout, and the whole fallback chain must finish well under 120s.
+PER_CALL_TIMEOUT_SECONDS = float(os.environ.get("GEMINI_CALL_TIMEOUT", "25"))
+TOTAL_BUDGET_SECONDS = float(os.environ.get("GEMINI_TOTAL_BUDGET", "90"))
+MIN_CALL_SECONDS = 5.0  # don't start a call with less time than this left
 
 
 class AllModelsFailedError(RuntimeError):
@@ -77,9 +84,11 @@ class RAGEngine:
         store: VectorStore,
         model: Union[str, Sequence[str], None] = None,
         top_k: int = 6,
-        retries_per_model: int = 1,
+        retries_per_model: int = 0,
         retry_backoff: float = 1.5,
         cooldown_seconds: float = 60.0,
+        per_call_timeout: float = PER_CALL_TIMEOUT_SECONDS,
+        total_budget: float = TOTAL_BUDGET_SECONDS,
     ):
         """
         model: a single model name, a list of models to try in order, or None to use
@@ -89,6 +98,9 @@ class RAGEngine:
         retry_backoff: seconds to wait before a retry on the same model (doubles each try).
         cooldown_seconds: after a model fails, skip it for this long on later
                requests so you don't waste time hammering an overloaded model.
+        per_call_timeout: max seconds for a single Gemini call before giving up on it.
+        total_budget: max seconds for the whole fallback chain. Keep this below the
+               gunicorn worker timeout (120s) or the host returns an HTML error page.
         """
         self.store = store
         if model is None:
@@ -105,6 +117,8 @@ class RAGEngine:
         self.retries_per_model = max(0, retries_per_model)
         self.retry_backoff = retry_backoff
         self.cooldown_seconds = cooldown_seconds
+        self.per_call_timeout = per_call_timeout
+        self.total_budget = total_budget
         self._cooldown_until: Dict[str, float] = {}
         self._client = None
 
@@ -134,19 +148,31 @@ class RAGEngine:
 
     def _generate_with_fallback(self, prompt: str) -> Tuple[str, str, List[Dict[str, str]]]:
         """Returns (answer_text, model_used, attempts_log)."""
+        import httpx
         from google.genai import types, errors
 
         client = self._get_client()
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=800,
-        )
+        deadline = time.monotonic() + self.total_budget
 
         failures: Dict[str, str] = {}
         attempts: List[Dict[str, str]] = []
 
+        def remaining() -> float:
+            return deadline - time.monotonic()
+
         for model in self._ordered_models():
             for attempt in range(self.retries_per_model + 1):
+                if remaining() < MIN_CALL_SECONDS:
+                    failures.setdefault(model, "skipped: time budget used up")
+                    raise AllModelsFailedError(failures)
+
+                call_timeout = min(self.per_call_timeout, remaining())
+                config = types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=800,
+                    # HttpOptions.timeout is in milliseconds
+                    http_options=types.HttpOptions(timeout=int(call_timeout * 1000)),
+                )
                 try:
                     response = client.models.generate_content(
                         model=model, contents=prompt, config=config
@@ -171,6 +197,12 @@ class RAGEngine:
                     logger.warning("Gemini model %s failed (%s)", model, msg)
                     if code == 404:
                         break  # model doesn't exist; retrying the same name is pointless
+                except (httpx.TimeoutException, httpx.TransportError) as e:
+                    msg = f"timeout/network error after {call_timeout:.0f}s: {type(e).__name__}"
+                    attempts.append({"model": model, "status": msg})
+                    failures[model] = msg
+                    logger.warning("Gemini model %s: %s", model, msg)
+                    break  # a hung model won't be faster on retry; move on
                 except ValueError as e:
                     msg = str(e)
                     attempts.append({"model": model, "status": msg})
@@ -179,7 +211,10 @@ class RAGEngine:
                     break
 
                 if attempt < self.retries_per_model:
-                    time.sleep(self.retry_backoff * (2 ** attempt))
+                    wait = self.retry_backoff * (2 ** attempt)
+                    if remaining() - wait < MIN_CALL_SECONDS:
+                        break
+                    time.sleep(wait)
 
             # Every attempt on this model failed: park it for a while.
             self._cooldown_until[model] = time.monotonic() + self.cooldown_seconds
